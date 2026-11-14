@@ -1,0 +1,35 @@
+[package]
+name = "discord-phoenix"
+version = "0.1.0"
+edition = "2021"
+description = "Cliente Discord nativo e leve escrito em Rust"
+license = "MIT"
+
+[[bin]]
+name = "DiscordPhoenix"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "=0.29.1", default-features = false, features = ["default_fonts", "glow"] }
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "sync", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+image-webp = "0.2"
+
+# Correção do AltGr/Alt Code no Windows: o egui-winit 0.29 descarta o texto
+# quando Ctrl+Alt estão pressionados, que é exatamente como o Windows reporta
+# o AltGr. O patch está em vendor/egui-winit.
+[patch.crates-io]
+egui-winit = { path = "vendor/egui-winit" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
