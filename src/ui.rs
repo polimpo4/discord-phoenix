@@ -30,6 +30,19 @@ enum View {
     Dm,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LoginMode {
+    Password,
+    Qr,
+    Token,
+}
+
+struct QrView {
+    texture: egui::TextureHandle,
+    expires_at: Instant,
+    scanned: Option<String>,
+}
+
 enum MsgAction {
     Edit(Message),
     Delete(Message),
@@ -49,6 +62,16 @@ pub struct App {
     login_error: Option<String>,
     auto_login: bool,
     settings: Settings,
+
+    login_mode: LoginMode,
+    login_email: String,
+    login_password: String,
+    login_code: String,
+    login_mfa: Option<String>,
+    qr: Option<QrView>,
+    qr_error: Option<String>,
+    force_remember: bool,
+    logo: Option<egui::TextureHandle>,
 
     me: Option<User>,
     demo: bool,
@@ -95,6 +118,36 @@ pub struct App {
     images: ImageCache,
 }
 
+fn load_logo(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let bytes = include_bytes!("../assets/logo.png");
+    let image = image::load_from_memory(bytes).ok()?.into_rgba8();
+    let size = [image.width() as usize, image.height() as usize];
+    let color = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+    Some(ctx.load_texture("phoenix-logo", color, egui::TextureOptions::LINEAR))
+}
+
+fn qr_texture(ctx: &egui::Context, data: &str) -> Option<egui::TextureHandle> {
+    let code = qrcode::QrCode::with_error_correction_level(data.as_bytes(), qrcode::EcLevel::M).ok()?;
+    let width = code.width();
+    let colors = code.to_colors();
+
+    // Quiet zone de 4 módulos e 1 pixel por módulo. A textura sobe com filtro
+    // NEAREST: os módulos ficam nítidos em qualquer escala e o QR continua
+    // escaneável (feathering do egui borrava as bordas).
+    let quiet = 4usize;
+    let total = width + quiet * 2;
+    let mut image = egui::ColorImage::new([total, total], Color32::WHITE);
+    for y in 0..width {
+        for x in 0..width {
+            if matches!(colors[y * width + x], qrcode::types::Color::Dark) {
+                image[(x + quiet, y + quiet)] = Color32::BLACK;
+            }
+        }
+    }
+
+    Some(ctx.load_texture("phoenix-qr", image, egui::TextureOptions::NEAREST))
+}
+
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::apply(&cc.egui_ctx);
@@ -128,6 +181,15 @@ impl App {
             login_error: None,
             auto_login: false,
             settings,
+            login_mode: LoginMode::Password,
+            login_email: String::new(),
+            login_password: String::new(),
+            login_code: String::new(),
+            login_mfa: None,
+            qr: None,
+            qr_error: None,
+            force_remember: false,
+            logo: load_logo(&cc.egui_ctx),
             me: None,
             demo: false,
             guilds: Vec::new(),
@@ -189,11 +251,22 @@ impl App {
         while let Ok(event) = self.events.try_recv() {
             match event {
                 Event::LoggedIn {
+                    token,
                     me,
                     guilds,
                     dms,
                     is_bot,
                 } => {
+                    self.token = token;
+                    if self.force_remember {
+                        self.remember = true;
+                    }
+                    self.force_remember = false;
+                    self.login_password.clear();
+                    self.login_code.clear();
+                    self.login_mfa = None;
+                    self.qr = None;
+                    self.qr_error = None;
                     self.screen = Screen::Main;
                     self.busy = false;
                     self.auto_login = false;
@@ -237,6 +310,63 @@ impl App {
                         self.settings.remember = false;
                         config::save_settings(&self.settings);
                     }
+                }
+
+                Event::LoginMfa { ticket } => {
+                    self.busy = false;
+                    self.login_error = None;
+                    self.login_mfa = Some(ticket);
+                    self.login_code.clear();
+                }
+
+                Event::RemoteAuthQr {
+                    url,
+                    expires_in_secs,
+                } => {
+                    self.busy = false;
+                    self.qr_error = None;
+                    match qr_texture(ctx, &url) {
+                        Some(texture) => {
+                            self.qr = Some(QrView {
+                                texture,
+                                expires_at: Instant::now()
+                                    + Duration::from_secs(expires_in_secs),
+                                scanned: None,
+                            });
+                        }
+                        None => {
+                            self.qr = None;
+                            self.qr_error = Some(
+                                "Não foi possível desenhar o QR Code. Tente gerar outro."
+                                    .to_string(),
+                            );
+                        }
+                    }
+                }
+
+                Event::RemoteAuthScanned {
+                    username,
+                    discriminator,
+                } => {
+                    if let Some(qr) = &mut self.qr {
+                        qr.scanned = Some(if discriminator == "0" || discriminator.is_empty() {
+                            format!("@{username}")
+                        } else {
+                            format!("@{username}#{discriminator}")
+                        });
+                    }
+                }
+
+                Event::RemoteAuthExpired => {
+                    if let Some(qr) = &mut self.qr {
+                        qr.expires_at = Instant::now();
+                    }
+                }
+
+                Event::RemoteAuthFailed(message) => {
+                    self.busy = false;
+                    self.qr = None;
+                    self.qr_error = Some(message);
                 }
 
                 Event::Channels {
@@ -531,7 +661,80 @@ impl App {
         self.is_bot = is_bot;
         self.busy = true;
         self.login_error = None;
+        self.force_remember = false;
         let _ = self.commands.send(Command::Login { token, is_bot });
+    }
+
+    fn start_password_login(&mut self) {
+        let email = self.login_email.trim().to_string();
+        if email.is_empty() {
+            self.login_error = Some("Digite seu e-mail ou número de telefone.".to_string());
+            return;
+        }
+        if self.login_password.is_empty() {
+            self.login_error = Some("Digite sua senha.".to_string());
+            return;
+        }
+
+        self.busy = true;
+        self.login_error = None;
+        self.login_mfa = None;
+        self.force_remember = true;
+        let _ = self.commands.send(Command::LoginPassword {
+            email,
+            password: self.login_password.clone(),
+        });
+    }
+
+    fn submit_mfa(&mut self) {
+        let Some(ticket) = self.login_mfa.clone() else {
+            return;
+        };
+        let code = self.login_code.trim().to_string();
+        if code.len() < 6 {
+            self.login_error = Some("Digite o código de 6 dígitos do app autenticador.".to_string());
+            return;
+        }
+
+        self.busy = true;
+        self.login_error = None;
+        let _ = self.commands.send(Command::SubmitMfa { ticket, code });
+    }
+
+    fn start_qr_login(&mut self) {
+        self.qr = None;
+        self.qr_error = None;
+        self.login_error = None;
+        self.login_mfa = None;
+        self.busy = true;
+        self.force_remember = true;
+        let _ = self.commands.send(Command::RemoteAuthStart);
+    }
+
+    fn cancel_qr(&mut self) {
+        let _ = self.commands.send(Command::RemoteAuthCancel);
+        self.qr = None;
+        self.qr_error = None;
+        self.busy = false;
+        self.force_remember = false;
+    }
+
+    fn switch_login_mode(&mut self, mode: LoginMode) {
+        if self.login_mode == mode || self.busy {
+            return;
+        }
+        if self.login_mode == LoginMode::Qr {
+            let _ = self.commands.send(Command::RemoteAuthCancel);
+            self.qr = None;
+            self.qr_error = None;
+        }
+        self.login_mode = mode;
+        self.login_error = None;
+        self.login_mfa = None;
+        self.login_code.clear();
+        if mode == LoginMode::Qr {
+            self.start_qr_login();
+        }
     }
 
     fn enter_demo(&mut self) {
@@ -603,11 +806,20 @@ impl App {
         self.token.clear();
         self.remember = false;
         self.settings.remember = false;
+        self.login_mode = LoginMode::Password;
+        self.login_email.clear();
+        self.login_password.clear();
+        self.login_code.clear();
+        self.login_mfa = None;
+        self.qr = None;
+        self.qr_error = None;
+        self.force_remember = false;
         config::clear_token();
         config::save_settings(&self.settings);
     }
 
     fn logout(&mut self) {
+        let _ = self.commands.send(Command::RemoteAuthCancel);
         let _ = self.commands.send(Command::Logout);
         self.reset_to_login();
     }
@@ -927,181 +1139,524 @@ impl App {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(theme::BG_DARKEST))
             .show(ctx, |ui| {
+                let background = ui.max_rect();
+                ui.painter().circle_filled(
+                    background.left_top() + egui::vec2(30.0, -30.0),
+                    360.0,
+                    Color32::from_rgba_unmultiplied(88, 101, 242, 18),
+                );
+                ui.painter().circle_filled(
+                    background.right_bottom() + egui::vec2(-20.0, 70.0),
+                    320.0,
+                    Color32::from_rgba_unmultiplied(235, 69, 158, 13),
+                );
+
                 ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.add_space(44.0);
+                        ui.add_space((ui.available_height() * 0.035).clamp(12.0, 32.0));
                         ui.vertical_centered(|ui| {
-                            let (logo_rect, _) =
-                                ui.allocate_exact_size(Vec2::splat(84.0), Sense::hover());
-                            let painter = ui.painter();
-                            painter.circle_filled(logo_rect.center(), 42.0, theme::ACCENT);
-                            painter.text(
-                                logo_rect.center(),
-                                Align2::CENTER_CENTER,
-                                "DP",
-                                FontId::proportional(30.0),
-                                Color32::WHITE,
-                            );
-
-                            ui.add_space(14.0);
-                            ui.label(
-                                RichText::new("DISCORD PHOENIX")
-                                    .size(28.0)
-                                    .strong()
-                                    .color(theme::TEXT),
-                            );
-                            ui.label(
-                                RichText::new("Cliente nativo em Rust, leve por design")
-                                    .size(14.0)
-                                    .color(theme::MUTED),
-                            );
-                            ui.add_space(24.0);
-
                             ui.allocate_ui_with_layout(
-                                Vec2::new(440.0, 0.0),
-                                Layout::top_down(Align::Min),
+                                Vec2::new(486.0, 0.0),
+                                Layout::top_down(Align::Center),
                                 |ui| {
                                     egui::Frame::none()
-                                        .fill(theme::BG_SIDEBAR)
-                                        .rounding(12.0)
-                                        .inner_margin(Margin::same(22.0))
+                                        .fill(Color32::from_rgb(49, 51, 56))
+                                        .rounding(14.0)
+                                        .stroke(Stroke::new(
+                                            1.0_f32,
+                                            Color32::from_rgb(60, 63, 70),
+                                        ))
+                                        .inner_margin(Margin::symmetric(30.0, 24.0))
                                         .show(ui, |ui| {
-                                            ui.set_width(374.0);
-                                            ui.label(
-                                                RichText::new("Entrar com token")
-                                                    .size(17.0)
-                                                    .strong(),
-                                            );
-                                            ui.label(
-                                                RichText::new(
-                                                    "Conta pessoal ou bot. O token fica só no seu computador.",
-                                                )
-                                                .size(12.0)
-                                                .color(theme::MUTED),
-                                            );
-                                            ui.add_space(12.0);
-
-                                            ui.label(
-                                                RichText::new("Token").size(12.0).color(theme::MUTED),
-                                            );
-                                            ui.add(
-                                                TextEdit::singleline(&mut self.token)
-                                                    .password(true)
-                                                    .hint_text("Cole o token aqui")
-                                                    .desired_width(f32::INFINITY),
-                                            );
-                                            ui.add_space(6.0);
-                                            ui.checkbox(
-                                                &mut self.is_bot,
-                                                "Este token é de um bot",
-                                            );
-                                            ui.checkbox(
-                                                &mut self.remember,
-                                                "Lembrar neste computador (DPAPI)",
-                                            );
-                                            ui.add_space(10.0);
-
-                                            if let Some(message) = &self.login_error {
-                                                egui::Frame::none()
-                                                    .fill(Color32::from_rgb(78, 32, 35))
-                                                    .rounding(6.0)
-                                                    .inner_margin(Margin::symmetric(10.0, 7.0))
-                                                    .show(ui, |ui| {
-                                                        ui.label(
-                                                            RichText::new(message)
-                                                                .size(12.0)
-                                                                .color(Color32::from_rgb(
-                                                                    255, 190, 190,
-                                                                )),
-                                                        );
-                                                    });
-                                                ui.add_space(8.0);
-                                            }
-
-                                            let label = if self.busy {
-                                                "Conectando..."
-                                            } else {
-                                                "Conectar"
-                                            };
-                                            let button = theme::accent_button(
-                                                RichText::new(label)
-                                                    .size(15.0)
-                                                    .strong()
-                                                    .color(Color32::WHITE),
-                                            );
-                                            if ui
-                                                .add_enabled(
-                                                    !self.busy,
-                                                    button.min_size(Vec2::new(
-                                                        ui.available_width(),
-                                                        38.0,
-                                                    )),
-                                                )
-                                                .clicked()
-                                            {
-                                                self.start_login();
-                                            }
-
-                                            if self.busy {
-                                                ui.add_space(8.0);
-                                                ui.horizontal(|ui| {
-                                                    ui.add(egui::Spinner::new().size(14.0));
-                                                    ui.label(
-                                                        RichText::new("Validando token e carregando servidores...")
-                                                            .size(11.5)
-                                                            .color(theme::MUTED),
-                                                    );
-                                                });
-                                            }
-
-                                            ui.add_space(12.0);
-                                            ui.separator();
-                                            ui.add_space(4.0);
-                                            if ui
-                                                .add(
-                                                    egui::Button::new(
-                                                        RichText::new("Entrar no modo demonstração")
-                                                            .size(13.0)
-                                                            .color(theme::MUTED),
-                                                    )
-                                                    .frame(false),
-                                                )
-                                                .clicked()
-                                            {
-                                                self.enter_demo();
-                                            }
+                                            ui.set_width(422.0);
+                                            self.ui_login_card(ui);
                                         });
                                 },
                             );
 
-                            ui.add_space(18.0);
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(440.0, 0.0),
-                                Layout::top_down(Align::Min),
-                                |ui| {
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "Este processo está usando {:.0} MB de RAM.",
-                                            self.ram_mb
-                                        ))
-                                        .size(12.0)
-                                        .color(theme::GREEN),
-                                    );
-                                    ui.add_space(6.0);
-                                    ui.label(
-                                        RichText::new(
-                                            "Aviso: clientes não oficiais com token de usuário violam os Termos do Discord. Use por sua conta e risco. Para integrações oficiais, prefira um token de bot.",
-                                        )
-                                        .size(11.0)
-                                        .color(Color32::from_rgb(200, 170, 90)),
-                                    );
-                                    ui.add_space(28.0);
-                                },
+                            ui.add_space(14.0);
+                            if ui
+                                .link(
+                                    RichText::new("Explorar no modo demonstração")
+                                        .size(13.0)
+                                        .color(theme::MUTED),
+                                )
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .clicked()
+                            {
+                                self.enter_demo();
+                            }
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new(format!(
+                                    "{:.0} MB de RAM • cliente nativo em Rust + egui",
+                                    self.ram_mb
+                                ))
+                                .size(11.0)
+                                .color(Color32::from_rgb(110, 116, 126)),
                             );
+                            ui.add_space(18.0);
                         });
                     });
             });
+    }
+
+    fn ui_login_card(&mut self, ui: &mut Ui) {
+        ui.vertical_centered(|ui| {
+            if let Some(logo) = &self.logo {
+                ui.add(
+                    egui::Image::new(egui::load::SizedTexture::new(
+                        logo.id(),
+                        Vec2::splat(64.0),
+                    ))
+                    .rounding(32.0),
+                );
+            } else {
+                let (logo_rect, _) =
+                    ui.allocate_exact_size(Vec2::splat(64.0), Sense::hover());
+                let painter = ui.painter();
+                painter.circle_filled(logo_rect.center(), 32.0, theme::ACCENT);
+                painter.text(
+                    logo_rect.center(),
+                    Align2::CENTER_CENTER,
+                    "DP",
+                    FontId::proportional(23.0),
+                    Color32::WHITE,
+                );
+            }
+            ui.add_space(12.0);
+
+            let (title, subtitle) = match self.login_mode {
+                LoginMode::Password => (
+                    "Boas-vindas de volta!",
+                    "Estamos felizes em ver você de novo!",
+                ),
+                LoginMode::Qr => (
+                    "Entrar com QR Code",
+                    "Escaneie o código com o app do Discord no celular.",
+                ),
+                LoginMode::Token => (
+                    "Entrar com token",
+                    "Conta pessoal ou bot. O token fica só no seu computador.",
+                ),
+            };
+            ui.label(RichText::new(title).size(25.0).strong().color(theme::TEXT));
+            ui.add_space(3.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(subtitle)
+                        .size(13.5)
+                        .color(theme::MUTED),
+                )
+                .wrap(),
+            );
+        });
+
+        ui.add_space(18.0);
+        self.ui_login_tabs(ui);
+        ui.add_space(18.0);
+
+        match self.login_mode {
+            LoginMode::Password => self.ui_login_password(ui),
+            LoginMode::Qr => self.ui_login_qr(ui),
+            LoginMode::Token => self.ui_login_token(ui),
+        }
+
+        ui.add_space(14.0);
+        ui.vertical_centered(|ui| {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(
+                        "Cliente não oficial. O login usa as APIs do Discord e pode \
+                         esbarrar em captcha ou verificação. Use por sua conta e risco.",
+                    )
+                    .size(10.5)
+                    .color(Color32::from_rgb(138, 124, 84)),
+                )
+                .wrap(),
+            );
+        });
+    }
+
+    fn ui_login_tabs(&mut self, ui: &mut Ui) {
+        let tabs = [
+            (LoginMode::Password, "E-mail e senha"),
+            (LoginMode::Qr, "QR Code"),
+            (LoginMode::Token, "Token"),
+        ];
+
+        egui::Frame::none()
+            .fill(theme::BG_DARKEST)
+            .rounding(11.0)
+            .inner_margin(Margin::same(4.0))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.horizontal(|ui| {
+                    let width = (ui.available_width() - 8.0) / 3.0;
+                    for (mode, label) in tabs {
+                        let selected = self.login_mode == mode;
+                        let (rect, response) =
+                            ui.allocate_exact_size(Vec2::new(width, 32.0), Sense::click());
+                        if response.clicked() && !selected && !self.busy {
+                            self.switch_login_mode(mode);
+                        }
+                        let background = if selected {
+                            theme::ACCENT
+                        } else if response.hovered() && !self.busy {
+                            theme::BG_HOVER
+                        } else {
+                            Color32::TRANSPARENT
+                        };
+                        ui.painter().rect_filled(rect, Rounding::same(8.0), background);
+                        let color = if selected {
+                            Color32::WHITE
+                        } else {
+                            theme::MUTED
+                        };
+                        ui.painter().text(
+                            rect.center(),
+                            Align2::CENTER_CENTER,
+                            label,
+                            FontId::proportional(12.5),
+                            color,
+                        );
+                    }
+                });
+            });
+    }
+
+    fn ui_login_password(&mut self, ui: &mut Ui) {
+        if self.login_mfa.is_some() {
+            egui::Frame::none()
+                .fill(Color32::from_rgb(35, 39, 51))
+                .rounding(7.0)
+                .inner_margin(Margin::symmetric(12.0, 9.0))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new("Autenticação em dois fatores")
+                            .size(12.5)
+                            .strong()
+                            .color(theme::TEXT),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "Abra o app autenticador e digite o código de 6 dígitos.",
+                        )
+                        .size(11.5)
+                        .color(theme::MUTED),
+                    );
+                });
+            ui.add_space(12.0);
+
+            login_field(ui, "CÓDIGO DE AUTENTICAÇÃO", &mut self.login_code, false, "login_mfa_code");
+            ui.add_space(12.0);
+
+            if let Some(message) = &self.login_error {
+                login_error_box(ui, message);
+            }
+
+            let label = if self.busy { "Verificando..." } else { "Verificar código" };
+            if ui
+                .add_enabled(
+                    !self.busy,
+                    theme::accent_button(
+                        RichText::new(label)
+                            .size(15.0)
+                            .strong()
+                            .color(Color32::WHITE),
+                    )
+                    .min_size(Vec2::new(ui.available_width(), 42.0)),
+                )
+                .clicked()
+            {
+                self.submit_mfa();
+            }
+
+            ui.add_space(10.0);
+            let mut back = false;
+            ui.vertical_centered(|ui| {
+                if login_link(ui, "Voltar para o login").clicked() {
+                    back = true;
+                }
+            });
+            if back {
+                self.login_mfa = None;
+                self.login_code.clear();
+                self.login_error = None;
+            }
+            return;
+        }
+
+        login_field(
+            ui,
+            "E-MAIL OU NÚMERO DE TELEFONE",
+            &mut self.login_email,
+            false,
+            "login_email",
+        );
+        ui.add_space(12.0);
+        login_field(ui, "SENHA", &mut self.login_password, true, "login_password");
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if login_link(ui, "Esqueceu sua senha?").clicked() {
+                open_url("https://discord.com/reset-password");
+            }
+        });
+        ui.add_space(12.0);
+
+        if let Some(message) = &self.login_error {
+            login_error_box(ui, message);
+        }
+
+        let label = if self.busy { "Entrando..." } else { "Entrar" };
+        if ui
+            .add_enabled(
+                !self.busy,
+                theme::accent_button(
+                    RichText::new(label)
+                        .size(15.5)
+                        .strong()
+                        .color(Color32::WHITE),
+                )
+                .min_size(Vec2::new(ui.available_width(), 42.0)),
+            )
+            .clicked()
+        {
+            self.start_password_login();
+        }
+
+        if self.busy {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(14.0));
+                ui.label(
+                    RichText::new("Falando com o Discord...")
+                        .size(11.5)
+                        .color(theme::MUTED),
+                );
+            });
+        }
+
+        let enter = ui.input(|input| input.key_pressed(Key::Enter));
+        if enter && !self.busy {
+            self.start_password_login();
+        }
+
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Precisa de uma conta?")
+                    .size(12.0)
+                    .color(theme::MUTED),
+            );
+            if login_link(ui, "Registrar").clicked() {
+                open_url("https://discord.com/register");
+            }
+        });
+    }
+
+    fn ui_login_qr(&mut self, ui: &mut Ui) {
+        let mut retry = false;
+        let mut cancel = false;
+
+        if let Some(qr) = &self.qr {
+            let remaining = qr
+                .expires_at
+                .saturating_duration_since(Instant::now())
+                .as_secs();
+            let expired = remaining == 0;
+
+            ui.vertical_centered(|ui| {
+                egui::Frame::none()
+                    .fill(Color32::WHITE)
+                    .rounding(12.0)
+                    .inner_margin(Margin::same(14.0))
+                    .show(ui, |ui| {
+                        let side = 196.0;
+                        let (rect, _) =
+                            ui.allocate_exact_size(Vec2::splat(side), Sense::hover());
+                        ui.painter().image(
+                            qr.texture.id(),
+                            rect,
+                            egui::Rect::from_min_max(
+                                egui::pos2(0.0, 0.0),
+                                egui::pos2(1.0, 1.0),
+                            ),
+                            Color32::WHITE,
+                        );
+                    });
+
+                ui.add_space(12.0);
+
+                if let Some(name) = &qr.scanned {
+                    ui.label(
+                        RichText::new(format!("Escaneado por {name}"))
+                            .size(13.5)
+                            .strong()
+                            .color(theme::GREEN),
+                    );
+                    ui.label(
+                        RichText::new("Confirme o login no seu celular.")
+                            .size(12.0)
+                            .color(theme::MUTED),
+                    );
+                } else if expired {
+                    ui.label(
+                        RichText::new("Código expirado, gerando outro...")
+                            .size(13.0)
+                            .color(theme::YELLOW),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new(format!(
+                            "O código expira em {:01}:{:02}",
+                            remaining / 60,
+                            remaining % 60
+                        ))
+                        .size(12.5)
+                        .color(theme::MUTED),
+                    );
+                }
+
+                ui.add_space(10.0);
+                if login_link(ui, "Gerar outro código").clicked() {
+                    retry = true;
+                }
+                if login_link(ui, "Cancelar").clicked() {
+                    cancel = true;
+                }
+            });
+
+            ui.add_space(12.0);
+        } else if let Some(message) = &self.qr_error {
+            ui.vertical_centered(|ui| {
+                login_error_box(ui, message);
+                if ui
+                    .add_enabled(
+                        !self.busy,
+                        theme::accent_button(
+                            RichText::new("Gerar QR Code")
+                                .size(14.5)
+                                .strong()
+                                .color(Color32::WHITE),
+                        )
+                        .min_size(Vec2::new(220.0, 40.0)),
+                    )
+                    .clicked()
+                {
+                    retry = true;
+                }
+            });
+        } else {
+            ui.vertical_centered(|ui| {
+                ui.add(egui::Spinner::new().size(22.0));
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("Gerando QR Code...")
+                        .size(13.0)
+                        .color(theme::MUTED),
+                );
+                ui.add_space(6.0);
+                if login_link(ui, "Cancelar").clicked() {
+                    cancel = true;
+                }
+            });
+        }
+
+        if self.qr.is_some() && self.qr_error.is_none() {
+            ui.add_space(4.0);
+            egui::Frame::none()
+                .fill(Color32::from_rgb(40, 42, 48))
+                .rounding(8.0)
+                .inner_margin(Margin::symmetric(12.0, 9.0))
+                .show(ui, |ui| {
+                    for (index, step) in [
+                        "Abra o Discord no celular",
+                        "Toque em \"Escanear QR Code\"",
+                        "Confirme o login",
+                    ]
+                    .iter()
+                    .enumerate()
+                    {
+                        ui.label(
+                            RichText::new(format!("{}. {step}", index + 1))
+                                .size(11.5)
+                                .color(theme::MUTED),
+                        );
+                    }
+                });
+        }
+
+        if retry {
+            self.start_qr_login();
+        } else if cancel {
+            self.cancel_qr();
+            self.switch_login_mode(LoginMode::Password);
+        }
+    }
+
+    fn ui_login_token(&mut self, ui: &mut Ui) {
+        ui.label(
+            RichText::new("Token")
+                .size(11.0)
+                .strong()
+                .color(theme::MUTED),
+        );
+        egui::Frame::none()
+            .fill(theme::BG_DARKEST)
+            .rounding(6.0)
+            .inner_margin(Margin::symmetric(10.0, 8.0))
+            .show(ui, |ui| {
+                ui.add(
+                    TextEdit::singleline(&mut self.token)
+                        .password(true)
+                        .hint_text("Cole o token da conta ou do bot")
+                        .frame(false)
+                        .desired_width(f32::INFINITY)
+                        .id_source("login_token"),
+                );
+            });
+        ui.add_space(8.0);
+        ui.checkbox(&mut self.is_bot, "Este token é de um bot");
+        ui.checkbox(
+            &mut self.remember,
+            "Lembrar neste computador (DPAPI)",
+        );
+        ui.add_space(14.0);
+
+        if let Some(message) = &self.login_error {
+            login_error_box(ui, message);
+        }
+
+        let label = if self.busy { "Conectando..." } else { "Conectar" };
+        if ui
+            .add_enabled(
+                !self.busy,
+                theme::accent_button(
+                    RichText::new(label)
+                        .size(15.0)
+                        .strong()
+                        .color(Color32::WHITE),
+                )
+                .min_size(Vec2::new(ui.available_width(), 42.0)),
+            )
+            .clicked()
+        {
+            self.start_login();
+        }
+
+        if self.busy {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(14.0));
+                ui.label(
+                    RichText::new("Validando token e carregando servidores...")
+                        .size(11.5)
+                        .color(theme::MUTED),
+                );
+            });
+        }
     }
 
     fn ui_main(&mut self, ctx: &egui::Context) {
@@ -1184,6 +1739,7 @@ impl App {
         let selected = self.selected_guild.clone();
         let view = self.view;
         let show_dms = !self.is_bot;
+        let logo_id = self.logo.as_ref().map(|logo| logo.id());
 
         egui::SidePanel::left("guild_rail")
             .exact_width(72.0)
@@ -1203,6 +1759,23 @@ impl App {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.vertical_centered(|ui| {
+                            if let Some(logo_id) = logo_id {
+                                let (rect, response) = ui.allocate_exact_size(
+                                    Vec2::splat(46.0),
+                                    Sense::hover(),
+                                );
+                                ui.painter().image(
+                                    logo_id,
+                                    rect,
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(0.0, 0.0),
+                                        egui::pos2(1.0, 1.0),
+                                    ),
+                                    Color32::WHITE,
+                                );
+                                response.on_hover_text("Discord Phoenix");
+                                rail_separator(ui);
+                            }
                             if show_dms && dm_button(ui, view == View::Dm) {
                                 clicked_dm = true;
                             }
@@ -3066,3 +3639,56 @@ fn fit_size(natural: Vec2, max: Vec2) -> Vec2 {
 }
 
 // UI_SECTIONS
+
+fn login_field(ui: &mut Ui, label: &str, value: &mut String, password: bool, id: &str) {
+    ui.label(
+        RichText::new(label)
+            .size(10.5)
+            .strong()
+            .color(theme::MUTED),
+    );
+    ui.add_space(2.0);
+    egui::Frame::none()
+        .fill(theme::BG_DARKEST)
+        .rounding(6.0)
+        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(45, 48, 54)))
+        .inner_margin(Margin::symmetric(10.0, 9.0))
+        .show(ui, |ui| {
+            ui.add(
+                TextEdit::singleline(value)
+                    .password(password)
+                    .frame(false)
+                    .desired_width(f32::INFINITY)
+                    .id_source(id),
+            );
+        });
+}
+
+fn login_error_box(ui: &mut Ui, message: &str) {
+    egui::Frame::none()
+        .fill(Color32::from_rgb(78, 32, 35))
+        .rounding(6.0)
+        .inner_margin(Margin::symmetric(10.0, 8.0))
+        .show(ui, |ui| {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(message)
+                        .size(12.0)
+                        .color(Color32::from_rgb(255, 190, 190)),
+                )
+                .wrap(),
+            );
+        });
+    ui.add_space(10.0);
+}
+
+fn login_link(ui: &mut Ui, text: &str) -> egui::Response {
+    ui.link(RichText::new(text).size(12.5).color(theme::LINK))
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn open_url(url: &str) {
+    let _ = std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .spawn();
+}

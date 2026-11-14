@@ -22,6 +22,12 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 image-webp = "0.2"
 
+# Login por e-mail/senha e por QR Code (remote auth).
+rsa = { version = "0.9", features = ["sha2"] }
+sha2 = "0.10"
+rand = "0.8"
+qrcode = { version = "0.14", default-features = false }
+
 # Correção do AltGr/Alt Code no Windows: o egui-winit 0.29 descarta o texto
 # quando Ctrl+Alt estão pressionados, que é exatamente como o Windows reporta
 # o AltGr. O patch está em vendor/egui-winit.

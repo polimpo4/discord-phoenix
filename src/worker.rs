@@ -2,10 +2,11 @@ use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use base64::Engine;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
 use crate::api::Api;
+use crate::auth;
 use crate::gateway;
 use crate::model::{Channel, Guild, Member, Message, User};
 
@@ -16,6 +17,16 @@ pub enum Command {
         token: String,
         is_bot: bool,
     },
+    LoginPassword {
+        email: String,
+        password: String,
+    },
+    SubmitMfa {
+        ticket: String,
+        code: String,
+    },
+    RemoteAuthStart,
+    RemoteAuthCancel,
     Logout,
     LoadChannels {
         guild_id: String,
@@ -56,12 +67,26 @@ pub enum Command {
 
 pub enum Event {
     LoggedIn {
+        token: String,
         me: User,
         guilds: Vec<Guild>,
         dms: Vec<Channel>,
         is_bot: bool,
     },
     LoginFailed(String),
+    LoginMfa {
+        ticket: String,
+    },
+    RemoteAuthQr {
+        url: String,
+        expires_in_secs: u64,
+    },
+    RemoteAuthScanned {
+        username: String,
+        discriminator: String,
+    },
+    RemoteAuthExpired,
+    RemoteAuthFailed(String),
     Channels {
         guild_id: String,
         channels: Vec<Channel>,
@@ -119,17 +144,21 @@ pub fn spawn(
     ctx: eframe::egui::Context,
 ) -> tokio::sync::mpsc::UnboundedSender<Command> {
     let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
-    runtime.spawn(actor(receiver, events, ctx));
+    let sender = commands.clone();
+    runtime.spawn(actor(receiver, sender, events, ctx));
     commands
 }
 
 async fn actor(
     mut commands: UnboundedReceiver<Command>,
+    sender: UnboundedSender<Command>,
     events: Sender<Event>,
     ctx: eframe::egui::Context,
 ) {
     let mut api: Option<Api> = None;
     let mut gateway_task: Option<JoinHandle<()>> = None;
+    let mut remote_task: Option<JoinHandle<()>> = None;
+    let auth_http = auth::http_client();
     let media = reqwest::Client::builder()
         .user_agent(crate::api::USER_AGENT)
         .timeout(Duration::from_secs(25))
@@ -139,66 +168,129 @@ async fn actor(
     while let Some(command) = commands.recv().await {
         match command {
             Command::Login { token, is_bot } => {
-                if let Some(task) = gateway_task.take() {
-                    task.abort();
-                }
+                abort_all(&mut gateway_task, &mut remote_task);
                 api = None;
+
+                if let Some((new_api, task)) =
+                    establish(token, is_bot, &events, &ctx).await
+                {
+                    api = Some(new_api);
+                    gateway_task = Some(task);
+                }
+            }
+
+            Command::LoginPassword { email, password } => {
+                abort_all(&mut gateway_task, &mut remote_task);
+                api = None;
+
+                match auth::password_login(&auth_http, &email, &password).await {
+                    Ok(auth::PasswordOutcome::Token(token)) => {
+                        if let Some((new_api, task)) = establish(token, false, &events, &ctx).await {
+                            api = Some(new_api);
+                            gateway_task = Some(task);
+                        }
+                    }
+                    Ok(auth::PasswordOutcome::Mfa { ticket }) => {
+                        emit(&events, &ctx, Event::LoginMfa { ticket });
+                    }
+                    Ok(auth::PasswordOutcome::Captcha { .. }) => {
+                        emit(
+                            &events,
+                            &ctx,
+                            Event::LoginFailed(auth::CAPTCHA_HELP.to_string()),
+                        );
+                    }
+                    Err(err) => emit(&events, &ctx, Event::LoginFailed(err)),
+                }
+            }
+
+            Command::SubmitMfa { ticket, code } => {
+                match auth::mfa_login(&auth_http, &ticket, &code).await {
+                    Ok(token) => {
+                        if let Some((new_api, task)) = establish(token, false, &events, &ctx).await {
+                            api = Some(new_api);
+                            gateway_task = Some(task);
+                        }
+                    }
+                    Err(err) => emit(&events, &ctx, Event::LoginFailed(err)),
+                }
+            }
+
+            Command::RemoteAuthStart => {
+                abort_all(&mut gateway_task, &mut remote_task);
+                api = None;
+
                 emit(
                     &events,
                     &ctx,
                     Event::Gateway {
-                        text: "Conectando ao Discord...".to_string(),
+                        text: "Aguardando confirmação no celular...".to_string(),
                         ready: false,
                     },
                 );
 
-                let candidate = Api::new(token.clone(), is_bot);
-                match candidate.me().await {
-                    Ok(me) => {
-                        let guilds = match candidate.guilds().await {
-                            Ok(guilds) => guilds,
-                            Err(err) => {
-                                emit(&events, &ctx, Event::LoginFailed(err.to_string()));
-                                continue;
+                let http = auth_http.clone();
+                let events = events.clone();
+                let ctx = ctx.clone();
+                let commands = sender.clone();
+                remote_task = Some(tokio::spawn(async move {
+                    loop {
+                        let notify_events = events.clone();
+                        let notify_ctx = ctx.clone();
+                        let notify = move |event: auth::RemoteAuthEvent| match event {
+                            auth::RemoteAuthEvent::Qr { url, expires_in } => emit(
+                                &notify_events,
+                                &notify_ctx,
+                                Event::RemoteAuthQr {
+                                    url,
+                                    expires_in_secs: expires_in.as_secs().max(1),
+                                },
+                            ),
+                            auth::RemoteAuthEvent::Scanned {
+                                username,
+                                discriminator,
+                            } => emit(
+                                &notify_events,
+                                &notify_ctx,
+                                Event::RemoteAuthScanned {
+                                    username,
+                                    discriminator,
+                                },
+                            ),
+                        };
+
+                        match auth::remote_auth_session(&http, notify).await {
+                            auth::RemoteAuthEnd::Token(token) => {
+                                let _ = commands.send(Command::Login {
+                                    token,
+                                    is_bot: false,
+                                });
+                                break;
                             }
-                        };
-
-                        let dms = if is_bot {
-                            Vec::new()
-                        } else {
-                            candidate.direct_messages().await.unwrap_or_default()
-                        };
-
-                        api = Some(candidate);
-                        emit(
-                            &events,
-                            &ctx,
-                            Event::LoggedIn {
-                                me,
-                                guilds,
-                                dms,
-                                is_bot,
-                            },
-                        );
-
-                        gateway_task =
-                            Some(tokio::spawn(gateway::run(
-                                token,
-                                is_bot,
-                                events.clone(),
-                                ctx.clone(),
-                            )));
+                            auth::RemoteAuthEnd::Expired => {
+                                emit(&events, &ctx, Event::RemoteAuthExpired);
+                                tokio::time::sleep(Duration::from_millis(350)).await;
+                            }
+                            auth::RemoteAuthEnd::Cancelled => {
+                                break;
+                            }
+                            auth::RemoteAuthEnd::Failed(message) => {
+                                emit(&events, &ctx, Event::RemoteAuthFailed(message));
+                                break;
+                            }
+                        }
                     }
-                    Err(err) => {
-                        emit(&events, &ctx, Event::LoginFailed(err.to_string()));
-                    }
+                }));
+            }
+
+            Command::RemoteAuthCancel => {
+                if let Some(task) = remote_task.take() {
+                    task.abort();
                 }
             }
 
             Command::Logout => {
-                if let Some(task) = gateway_task.take() {
-                    task.abort();
-                }
+                abort_all(&mut gateway_task, &mut remote_task);
                 api = None;
                 emit(&events, &ctx, Event::LoggedOut);
             }
@@ -356,6 +448,71 @@ async fn actor(
             }
         }
     }
+}
+
+fn abort_all(gateway: &mut Option<JoinHandle<()>>, remote: &mut Option<JoinHandle<()>>) {
+    if let Some(task) = gateway.take() {
+        task.abort();
+    }
+    if let Some(task) = remote.take() {
+        task.abort();
+    }
+}
+
+/// Valida o token, carrega o usuário/servidores e inicia o gateway. Devolve a
+/// API pronta e a tarefa do gateway para o ator guardar.
+async fn establish(
+    token: String,
+    is_bot: bool,
+    events: &Sender<Event>,
+    ctx: &eframe::egui::Context,
+) -> Option<(Api, JoinHandle<()>)> {
+    emit(
+        events,
+        ctx,
+        Event::Gateway {
+            text: "Conectando ao Discord...".to_string(),
+            ready: false,
+        },
+    );
+
+    let candidate = Api::new(token.clone(), is_bot);
+    let me = match candidate.me().await {
+        Ok(me) => me,
+        Err(err) => {
+            emit(events, ctx, Event::LoginFailed(err.to_string()));
+            return None;
+        }
+    };
+
+    let guilds = match candidate.guilds().await {
+        Ok(guilds) => guilds,
+        Err(err) => {
+            emit(events, ctx, Event::LoginFailed(err.to_string()));
+            return None;
+        }
+    };
+
+    let dms = if is_bot {
+        Vec::new()
+    } else {
+        candidate.direct_messages().await.unwrap_or_default()
+    };
+
+    emit(
+        events,
+        ctx,
+        Event::LoggedIn {
+            token: token.clone(),
+            me,
+            guilds,
+            dms,
+            is_bot,
+        },
+    );
+
+    let task = tokio::spawn(gateway::run(token, is_bot, events.clone(), ctx.clone()));
+    Some((candidate, task))
 }
 
 async fn fetch_media(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {

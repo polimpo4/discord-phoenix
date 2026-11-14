@@ -8,6 +8,34 @@ use crate::model::{Channel, Guild, Member, Message, User};
 
 pub const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
+/// Cabeçalho `X-Super-Properties` usado tanto na API REST quanto no login.
+/// O Discord usa esses dados para identificar o cliente; manter um valor
+/// estável evita que cada requisição pareça um dispositivo diferente.
+pub fn super_properties() -> String {
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let props = json!({
+                "os": "Windows",
+                "browser": "Chrome",
+                "device": "",
+                "system_locale": "pt-BR",
+                "browser_user_agent": USER_AGENT,
+                "browser_version": "131.0.0.0",
+                "os_version": "10",
+                "referrer": "",
+                "referring_domain": "",
+                "referrer_current": "",
+                "referring_domain_current": "",
+                "release_channel": "stable",
+                "client_build_number": 350000,
+                "client_event_source": null
+            });
+            base64::engine::general_purpose::STANDARD.encode(props.to_string().as_bytes())
+        })
+        .clone()
+}
+
 #[derive(Debug, Clone)]
 pub struct ApiError {
     pub status: u16,
@@ -51,24 +79,7 @@ impl Api {
             .build()
             .expect("falha ao criar cliente HTTP");
 
-        let props = json!({
-            "os": "Windows",
-            "browser": "Chrome",
-            "device": "",
-            "system_locale": "pt-BR",
-            "browser_user_agent": USER_AGENT,
-            "browser_version": "131.0.0.0",
-            "os_version": "10",
-            "referrer": "",
-            "referring_domain": "",
-            "referrer_current": "",
-            "referring_domain_current": "",
-            "release_channel": "stable",
-            "client_build_number": 350000,
-            "client_event_source": null
-        });
-        let super_properties = base64::engine::general_purpose::STANDARD
-            .encode(props.to_string().as_bytes());
+        let super_properties = super_properties();
 
         Self {
             client,

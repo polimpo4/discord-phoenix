@@ -1,5 +1,9 @@
 <p align="center">
-  <img src="assets/banner.svg" alt="Discord Phoenix — cliente nativo em Rust + egui" width="100%">
+  <img src="assets/logo.png" width="132" alt="Logo do Discord Phoenix">
+</p>
+
+<p align="center">
+  <img src="assets/banner.png" alt="Discord Phoenix — cliente nativo em Rust + egui" width="100%">
 </p>
 
 <p align="center">
@@ -28,6 +32,7 @@ demonstração — enquanto clientes baseados em Electron costumam passar de
 
 - **Nativo de verdade:** binário único, sem runtime web.
 - **Leve por design:** cache de mídia com limites de tamanho, quadros e entradas.
+- **Login como o Discord:** e-mail e senha com 2FA, QR Code (remote auth) ou token.
 - **Feito para Windows:** DPAPI para o token, fontes do sistema e correção de
   AltGr/Alt Code para teclados ABNT2.
 - **Modo demonstração:** explore a interface inteira sem token e sem login.
@@ -40,25 +45,34 @@ demonstração — enquanto clientes baseados em Electron costumam passar de
 
 <p align="center"><em>Servidores, canais, DMs, markdown, GIFs, embeds e lista de membros na mesma tela.</em></p>
 
+<p align="center">
+  <img src="assets/screenshot-login.png" alt="Login com e-mail e senha" width="49%">
+  <img src="assets/screenshot-qr.png" alt="Login com QR Code" width="49%">
+</p>
+
+<p align="center"><em>Login com e-mail e senha (com 2FA) ou QR Code — o mesmo fluxo do cliente oficial, desenhado em egui.</em></p>
+
 | Configurações do servidor | Seletor de emojis |
 |:---:|:---:|
 | <img src="assets/screenshot-settings.png" alt="Configurações do servidor" width="100%"> | <img src="assets/screenshot-emojis.png" alt="Seletor de emojis" width="100%"> |
 | Nome, dono, contagem, cargos e atualização de dados. | Busca por nome/atalho e grupos de emojis. |
 
-<p align="center">
-  <img src="assets/screenshot-login.png" alt="Tela de login" width="72%">
-</p>
-
-<p align="center"><em>Login com token de conta ou bot, com armazenamento seguro via DPAPI.</em></p>
-
 ## O que já está funcional
 
 ### Autenticação e sessão
 
-- [x] Login com **token de conta** ou **token de bot**.
+- [x] Login com **e-mail/telefone e senha** direto na API do Discord
+  (`/auth/login`), igual ao cliente oficial.
+- [x] **Autenticação em dois fatores (TOTP)** pelo app autenticador (`/auth/mfa/totp`).
+- [x] Login por **QR Code** via gateway de autenticação remota
+  (`remote-auth-gateway`): o código é gerado e desenhado nativamente no egui e
+  a confirmação acontece no app do celular.
+- [x] QR com **RSA-OAEP-SHA256** para o `nonce_proof`, `pending_ticket` e
+  `pending_login`; renovação automática quando o código expira.
+- [x] Login com **token de conta** ou **token de bot** como alternativa.
 - [x] Detecção automática do prefixo `Bot ` no token.
 - [x] Token salvo com **DPAPI** do Windows (`%APPDATA%\DiscordPhoenix`), nunca em texto puro.
-- [x] Logout limpa a sessão e o token persistido.
+- [x] Logout limpa a sessão, o token persistido e o estado do QR.
 - [x] Sessão restaurada automaticamente ao abrir o app.
 
 ### Servidores, canais e DMs
@@ -113,16 +127,20 @@ demonstração — enquanto clientes baseados em Electron costumam passar de
 
 ### Extras
 
+- [x] Identidade visual própria: logo embutido no executável e usado como ícone
+  da janela, na tela de login e no topo do rail de servidores.
 - [x] Modo demonstração completo, sem token e sem login.
 - [x] Consumo de RAM exibido em tempo real na barra de status.
 - [x] Correção local do **AltGr/Ctrl+Alt** no `egui-winit` para ABNT2.
 - [x] Fontes do Windows para acentos, símbolos e Alt Codes.
-- [x] 18 testes automatizados (modelo, markdown, emojis, imagens, DPAPI e fontes).
+- [x] 24 testes automatizados (modelo, markdown, emojis, imagens, DPAPI, login e
+  QR; o teste que abre o gateway real do Discord é opcional).
 
 ## Em desenvolvimento / roadmap
 
 ### Curto prazo
 
+- [ ] Resolver **captcha hCaptcha** no login por senha (hoje o app orienta usar o QR Code).
 - [ ] Paginação do histórico (scroll infinito) em vez de apenas as 50 últimas.
 - [ ] Scroll de membros com paginação para servidores grandes.
 - [ ] Emojis personalizados renderizados inline (hoje aparecem como `:nome:`).
@@ -151,6 +169,10 @@ demonstração — enquanto clientes baseados em Electron costumam passar de
 
 - **Windows 10/11 apenas** nesta versão.
 - **Sem voz, vídeo ou compartilhamento de tela.**
+- O login por **e-mail e senha** pode cair em **captcha hCaptcha**, que o app
+  não resolve. Nesse caso o próprio Phoenix recomenda a aba **QR Code**, que
+  entra pelo celular sem captcha. O login por senha também não contém o
+  “hCaptcha invisível” do site oficial.
 - O markdown cobre o subconjunto mais usado, não a especificação inteira.
 - Emojis personalizados aparecem como texto (`:nome:`), não como imagem.
 - GIFs animados são limitados a **16 quadros** e **240×240 px**; imagens
@@ -199,19 +221,26 @@ são baixadas de URLs públicas.
 
 ### Entrar com sua conta
 
-1. Abra o aplicativo.
-2. Cole o token de conta ou de bot.
-3. Marque **“Este token é de um bot”** se for o caso.
-4. Marque **“Lembrar neste computador (DPAPI)”** para persistir a sessão.
-5. Clique em **Conectar**.
+A tela de login tem três abas:
+
+1. **E-mail e senha** — digite o e-mail/telefone e a senha. Se a conta tiver
+   2FA, o app pede o código de 6 dígitos do app autenticador.
+2. **QR Code** — abra o Discord no celular, toque em **Escanear QR Code** e
+   confirme. O Phoenix gera o QR nativamente e mostra o nome de quem escaneou.
+3. **Token** — cole o token de conta ou de bot, marque **“Este token é de um
+   bot”** se for o caso e clique em **Conectar**.
+
+Em qualquer modo, marque **“Lembrar neste computador (DPAPI)”** para persistir
+a sessão. O login por senha e por QR já lembram por padrão.
 
 ## Arquitetura
 
 | Módulo | Responsabilidade |
 |---|---|
-| `src/main.rs` | Ponto de entrada e configuração da janela nativa. |
-| `src/ui.rs` | Toda a interface egui: rail, canais, chat, membros, configurações, emojis e compositor. |
+| `src/main.rs` | Ponto de entrada, ícone embutido e configuração da janela nativa. |
+| `src/ui.rs` | Toda a interface egui: login, QR, rail, canais, chat, membros, configurações, emojis e compositor. |
 | `src/worker.rs` | Ator assíncrono que executa comandos de rede e envia eventos para a UI. |
+| `src/auth.rs` | Login por e-mail/senha, MFA TOTP e remote auth (QR Code) com RSA-OAEP. |
 | `src/api.rs` | Cliente REST do Discord (guilds, canais, mensagens, membros). |
 | `src/gateway.rs` | WebSocket do Gateway v10, heartbeat e dispatch de eventos. |
 | `src/model.rs` | Estruturas de usuário, servidor, cargo, membro, canal, embed e mensagem. |
@@ -227,7 +256,12 @@ são baixadas de URLs públicas.
 
 - Interface: `eframe` / `egui 0.29` com renderer `glow`.
 - Rede: `tokio`, `reqwest` e `tokio-tungstenite`.
-- Imagens: `image` e `image-webp` (para animação WebP, que o crate `image` não expõe).
+- Login por QR: `rsa` (RSA-OAEP-SHA256), `sha2` para o `nonce_proof` e
+  `qrcode` para gerar a matriz desenhada no egui.
+- O QR é enviado como textura com filtro **NEAREST** para os módulos ficarem
+  nítidos e escaneáveis.
+- Imagens: `image` e `image-webp` (para animação WebP, que o crate `image` não
+  expõe).
 - O cache de mídia tem limite de **80 entradas** e falhas são memorizadas para
   evitar downloads repetidos.
 - O token é cifrado com `CryptProtectData` (DPAPI) e nunca é impresso em log.
@@ -238,8 +272,11 @@ são baixadas de URLs públicas.
 
 - Nenhuma telemetria, analytics ou servidor intermediário.
 - O token fica somente no seu computador, protegido pelo DPAPI do Windows.
-- Os prints deste README foram feitos no **modo demonstração**, sem conta real.
-- O app nunca imprime o token no terminal.
+- A senha digitada no login é enviada apenas para o Discord, via HTTPS, e não é
+  armazenada. O que fica salvo é o token resultante.
+- Os prints deste README foram feitos no **modo demonstração**, sem conta real;
+  o QR mostrado é de uma sessão de login já encerrada.
+- O app nunca imprime o token nem a senha no terminal.
 
 ## Aviso importante
 
